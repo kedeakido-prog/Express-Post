@@ -67,11 +67,15 @@ function _normalise(row) {
     delayReason:       row.delay_reason      || row.delayReason      || null,
     delayTimestamp:    row.delay_timestamp   || row.delayTimestamp   || null,
     createdAt:         row.created_at        || row.createdAt        || '',
+    // Carry DB progress through — written by admin _syncShipToSupabase
+    progress_pct:      typeof row.progress_pct === 'number' ? row.progress_pct : (row.progress_pct ? parseInt(row.progress_pct, 10) : 0),
     sender:            _jp(row.sender)   || {},
     receiver:          _jp(row.receiver) || {},
-    origin:            (function(){ const o=_jp(row.origin)||{}; return Object.keys(o).length ? o : { city: row.origin_city||'—', country:'', coordinates:[0,0] }; })(),
-    destination:       (function(){ const d=_jp(row.destination)||{}; return Object.keys(d).length ? d : { city: row.destination_city||'—', country:'', coordinates:[0,0] }; })(),
-    currentLocation:   (function(){ const cl=_jp(row.current_location||row.currentLocation)||{}; const o=_jp(row.origin)||{}; return Object.keys(cl).length ? cl : (Object.keys(o).length ? o : { city: row.origin_city||'—', country:'', coordinates:[0,0] }); })(),
+    // Merge flat columns into JSONB so origin_city always wins over stale JSONB city.
+    // This ensures edits to origin/destination cities are reflected after cache refresh.
+    origin:            Object.assign({ city: row.origin_city||'—', country:'Australia', coordinates:[0,0] }, _jp(row.origin)||{}, row.origin_city ? { city: row.origin_city } : {}),
+    destination:       Object.assign({ city: row.destination_city||'—', country:'Australia', coordinates:[0,0] }, _jp(row.destination)||{}, row.destination_city ? { city: row.destination_city } : {}),
+    currentLocation:   (function(){ const cl=_jp(row.current_location||row.currentLocation)||{}; return Object.assign({ city: row.origin_city||'—', country:'Australia', coordinates:[0,0] }, _jp(row.origin)||{}, Object.keys(cl).length ? cl : {}); })(),
     timeline:          row.timeline          || [],
     images:            row.images            || [],
   };
@@ -99,9 +103,11 @@ const SyncEngine = {
   async saveShipment(ship) {
     const client = db();
     if (!client) return null;
+    // Use UPDATE instead of upsert to avoid needing a PK/unique constraint on id
     const { data, error } = await client
       .from('shipments')
-      .upsert(ship, { onConflict: 'id' })
+      .update(ship)
+      .eq('id', ship.id)
       .select()
       .single();
     if (error) { console.error('[SyncEngine] saveShipment:', error.message); return null; }
@@ -131,10 +137,32 @@ const SyncEngine = {
 
   async refreshShipmentCache() {
     const ships = await this.loadShipmentsAsync();
-    window._shipmentCache = ships;
+    // Merge: preserve in-memory currentLocation/status for actively moving shipments
+    // so that a Supabase Realtime event doesn't clobber a tick that just ran.
+    const moveStates = window._moveStateCache || {};
+    const existing   = window._shipmentCache  || [];
+    const merged = ships.map(fresh => {
+      const ms = moveStates[fresh.id];
+      if (ms && ms.state === 'running') {
+        const inMem = existing.find(e => e.id === fresh.id);
+        if (inMem && inMem.currentLocation && inMem.currentLocation.lat) {
+          // Deep-merge: DB row fields update tracking info, but live GPS position is preserved
+          if (SyncEngine.safeMergeShipment) {
+            return SyncEngine.safeMergeShipment(inMem, fresh);
+          }
+          return Object.assign({}, fresh, {
+            currentLocation: inMem.currentLocation,
+            status: inMem.status || fresh.status,
+            progress_pct: (inMem.progress !== undefined ? inMem.progress : fresh.progress_pct) || fresh.progress_pct || 0,
+          });
+        }
+      }
+      return fresh;
+    });
+    window._shipmentCache = merged;
     // Also update window.ships used by admin panel
-    if (typeof window.ships !== 'undefined') window.ships = ships;
-    return ships;
+    if (typeof window.ships !== 'undefined') window.ships = merged;
+    return merged;
   },
 
   /* Fast lookup by tracking number — ALWAYS hits DB for cross-device accuracy */
@@ -195,7 +223,17 @@ const SyncEngine = {
 
   /* ── ROUTES (in-memory geometry) ── */
   loadRoutes()  { return _routeCache; },
-  saveRoutes(r) { Object.assign(_routeCache, r); },
+  saveRoutes(r) {
+    // Merge incoming routes — honour explicit undefined/null values as deletions
+    Object.keys(r).forEach(k => {
+      if(r[k] === null || r[k] === undefined || (Array.isArray(r[k]) && r[k].length === 0)){
+        delete _routeCache[k];
+      } else {
+        _routeCache[k] = r[k];
+      }
+    });
+  },
+  deleteRoute(shipId) { delete _routeCache[shipId]; },
 
   getShipmentPosition(shipId) {
     const states = this.loadMoveStates();
@@ -406,6 +444,90 @@ const SyncEngine = {
 
   _broadcast,
   _normalise,
+
+  /* ── SAFE SHIPMENT MERGE ──────────────────────────────────────────────
+     Deep-merge a partial update into the current shipment object without
+     destroying nested fields or live position data.
+     
+     Priority rules:
+     - update wins for scalar fields (status, packageName, etc.)
+     - For objects (origin, destination, sender, receiver): deep merge,
+       never let a partial object wipe a fully-populated existing one
+     - currentLocation: only update if the update has a valid city/lat/lng.
+       A DB refresh with currentLocation.city = origin city must NOT overwrite
+       a live mid-route position that tickMovement set in memory.
+     ────────────────────────────────────────────────────────────────────── */
+  safeMergeShipment(current, update) {
+    if (!current) return update;
+    if (!update)  return current;
+
+    // Deep merge for nested objects — never replace a rich object with an empty one
+    function _mergeObj(cur, upd) {
+      if (!upd || typeof upd !== 'object') return cur;
+      if (!cur || typeof cur !== 'object') return upd;
+      const result = Object.assign({}, cur);
+      for (const [k, v] of Object.entries(upd)) {
+        if (v !== null && v !== undefined && v !== '' && v !== '—') {
+          if (typeof v === 'object' && !Array.isArray(v)) {
+            result[k] = _mergeObj(cur[k], v);
+          } else {
+            result[k] = v;
+          }
+        }
+        // If update has explicit null, allow it (intentional clear)
+        else if (v === null) {
+          result[k] = null;
+        }
+        // Otherwise keep current value (don't overwrite with empty string or '—')
+      }
+      return result;
+    }
+
+    const merged = Object.assign({}, current);
+
+    // Scalar fields — update wins if not empty
+    const scalars = ['status','packageName','packageType','transportMode','weight',
+      'dimensions','estimatedDelivery','delayReason','delayTimestamp','notes',
+      'trackingNumber','progress','progress_pct','statusText','statusColor',
+      'senderName','senderAddress','receiverName','receiverAddress','shippingMethod',
+      'dispatchDate','receiverEmail','receiverPhone','_adminManaged'];
+    scalars.forEach(k => {
+      const v = update[k];
+      if (v !== undefined && v !== null && v !== '' && v !== '—') merged[k] = v;
+      else if (v === null) merged[k] = null; // explicit clear
+    });
+
+    // Arrays — update wins if non-empty
+    if (Array.isArray(update.timeline) && update.timeline.length > 0) merged.timeline = update.timeline;
+    if (Array.isArray(update.images)   && update.images.length > 0)   merged.images   = update.images;
+
+    // Nested objects — deep merge
+    merged.sender      = _mergeObj(current.sender,      update.sender);
+    merged.receiver    = _mergeObj(current.receiver,     update.receiver);
+    merged.origin      = _mergeObj(current.origin,       update.origin);
+    merged.destination = _mergeObj(current.destination,  update.destination);
+    merged.courier     = _mergeObj(current.courier,      update.courier);
+
+    // currentLocation — SPECIAL: only accept update if it has a genuine position.
+    // A city-only update (coordinates = [0,0] or missing) from a DB refresh must
+    // NOT overwrite a live GPS position that the movement engine set.
+    const upCL = update.currentLocation;
+    const curCL = current.currentLocation;
+    if (upCL) {
+      const upHasLivePos = upCL.lat && Math.abs(upCL.lat) > 0.01;
+      const curHasLivePos = curCL && curCL.lat && Math.abs(curCL.lat) > 0.01;
+      if (upHasLivePos) {
+        // Update has a real GPS position — always accept it
+        merged.currentLocation = _mergeObj(curCL, upCL);
+      } else if (!curHasLivePos) {
+        // Neither has live pos — safe to merge city name
+        merged.currentLocation = _mergeObj(curCL, upCL);
+      }
+      // else: current has live GPS, update only has a city name → KEEP current
+    }
+
+    return merged;
+  },
 
   /* ── SESSION REGISTRY ── */
   loadSessions() { return window._sessionCache || {}; },

@@ -225,25 +225,13 @@
 <script src="js/professional-routes.js"></script>
 <script>
   // ═══════════════════════════════════════════════════════════
-  //  REAL-TIME SYNC — Instant admin→user updates
-  //  • move_update     → fast path: update delay banner + truck pos
-  //  • shipment_update → full rebuild (status change, delay, etc)
+  //  REAL-TIME SYNC — handled by script.js SyncEngine.onUpdate
+  //  This block only covers the sync banner helper and
+  //  move_update fast-path (location/progress bar updates).
+  //  Full shipment_update re-renders are in script.js to avoid
+  //  the double-listener shake/flicker bug.
   // ═══════════════════════════════════════════════════════════
   (function() {
-    var _syncCooldown = false;
-
-    function _getActiveShip() {
-      var input = document.getElementById('tracking-number-input');
-      if (!input || !input.value.trim()) return null;
-      var num = input.value.trim().toUpperCase();
-      // Use Supabase cache — NOT MOCK_SHIPMENTS
-      var cache = window._shipmentCache || [];
-      var found = cache.find(function(s) {
-        return (s.trackingNumber || s.tracking_number || '').toUpperCase() === num;
-      });
-      return found ? found : null;
-    }
-
     function _showSyncBanner(msg) {
       var banner = document.getElementById('sync-banner');
       var msgEl  = document.getElementById('sync-msg');
@@ -254,106 +242,66 @@
       }
     }
 
+    // Expose so script.js can call it
+    window._showSyncBanner = _showSyncBanner;
+
     if (window.SyncEngine) {
       SyncEngine.onUpdate(function(data) {
-
-        // ── MOVE UPDATE: reposition truck + update current location ──
+        // ── MOVE UPDATE: fast path — update position/progress widgets only ──
+        // Full shipment re-renders on shipment_update are handled by script.js
+        // to prevent the double-listener DOM shake bug.
         if (data.type === 'move_update') {
-          var ship = _getActiveShip();
+          var input = document.getElementById('tracking-number-input');
+          if (!input || !input.value.trim()) return;
+          var num = input.value.trim().toUpperCase();
+          var cache = window._shipmentCache || [];
+          var ship = cache.find(function(s) {
+            return (s.trackingNumber || s.tracking_number || '').toUpperCase() === num;
+          });
           if (!ship) return;
+
           var ms = SyncEngine.loadMoveStates ? SyncEngine.loadMoveStates() : {};
           var state = ms[ship.id || ship.trackingNumber];
 
-          // Update live location display
+          // Fast-path: update displayed progress/location without full rebuild
           if (state && state.state === 'running' && state.routeIdx !== undefined) {
-            // Get position from movement engine
             var livePos = window.SyncEngine.getShipmentPosition
               ? window.SyncEngine.getShipmentPosition(ship.id || ship.trackingNumber)
               : null;
             if (livePos) {
-              // Update location display without full rebuild
               var lld = document.getElementById('live-location-display');
-              var curLocEl = document.getElementById('current-location-city');
-              var progBar = document.getElementById('progress-bar-fill');
-              var progPct = document.getElementById('progress-pct');
-              if (lld && livePos.city) lld.textContent = livePos.city;
-              if (curLocEl && livePos.city) curLocEl.textContent = livePos.city;
-              if (progBar && typeof livePos.progress === 'number') progBar.style.width = livePos.progress + '%';
-              if (progPct && typeof livePos.progress === 'number') progPct.textContent = livePos.progress + '%';
-              // Update map if open
-              if (window.leafletMap && window.initAustraliaMap && livePos.lat && livePos.lng) {
-                var updatedShip = Object.assign({}, ship, {
-                  currentLocation: { city: livePos.city||ship.currentLocation.city, lat: livePos.lat, lng: livePos.lng, coordinates: [livePos.lat, livePos.lng] },
-                  progress: livePos.progress
-                });
-                window.initAustraliaMap(updatedShip);
+              var progBarFill = document.getElementById('progress-fill');
+              var progPctEl   = document.getElementById('live-progress-pct');
+              var progMapEl   = document.getElementById('live-progress-map');
+              if (lld && livePos.city) lld.textContent = livePos.city + ', Australia';
+              if (progBarFill && typeof livePos.progress === 'number') progBarFill.style.width = livePos.progress + '%';
+              if (progPctEl && typeof livePos.progress === 'number') progPctEl.textContent = livePos.progress;
+              if (progMapEl && typeof livePos.progress === 'number') progMapEl.textContent = livePos.progress + '%';
+              // Update cached ship so PDF gets fresh data
+              if (window._currentDisplayedShipment) {
+                window._currentDisplayedShipment.progress = livePos.progress;
+                if (livePos.city) {
+                  window._currentDisplayedShipment.currentLocation = Object.assign(
+                    {}, window._currentDisplayedShipment.currentLocation,
+                    { city: livePos.city, lat: livePos.lat, lng: livePos.lng }
+                  );
+                }
               }
             }
           }
 
           if (state && state.state === 'delayed') {
-            var wasAlreadyDelayed = ship.status === 'delayed';
-            ship.status = 'delayed';
-            ship.delayReason = state.delayReason || ship.delayReason || 'Logistics Issues';
-            ship.delayTimestamp = state.delayTimestamp || ship.delayTimestamp || null;
-            if(state.delayLocation) ship.delayLocation = state.delayLocation;
             _showSyncBanner('\u23f8 Shipment delay applied by dispatch');
-            if (window.ProfessionalRoutes && window.ProfessionalRoutes.injectDelayBanner) {
-              window.ProfessionalRoutes.injectDelayBanner(ship);
-            }
-            if (!wasAlreadyDelayed && window.showDelayPopup) {
-              if(window._delayPopupShownFor) delete window._delayPopupShownFor[ship.trackingNumber+'|'+(ship.delayReason||'')];
-              setTimeout(function(){ window.showDelayPopup(ship); }, 400);
-            }
           } else if (state && state.state === 'paused') {
             _showSyncBanner('\u23f8 Shipment movement paused by dispatch');
           } else if (state && state.state === 'running') {
             var oldBanner = document.getElementById('pr-delay-banner');
             if (oldBanner) oldBanner.remove();
-            _showSyncBanner('\u2705 Shipment movement resumed');
           }
           return;
         }
 
-        // ── SHIPMENT UPDATE: full card rebuild ──
-        if (data.type === 'shipment_update') {
-          if (_syncCooldown) return;
-          _syncCooldown = true;
-          setTimeout(function() { _syncCooldown = false; }, 1500);
-          var inputEl = document.getElementById('tracking-number-input');
-          var tn = inputEl ? inputEl.value.trim().toUpperCase() : '';
-          // Refresh cache from Supabase for accurate state
-          // CRITICAL FIX: Only show "removed" if BOTH the deleted store marks it deleted
-          // AND mergeAdminShipments() confirmed it with _deleted flag. This prevents stale
-          // deleted-store entries from incorrectly hiding active shipments.
-          var _cacheHasIt = (window._shipmentCache||[]).some(function(s){ return (s.trackingNumber||s.tracking_number||'').toUpperCase() === tn; });
-          if (tn && !_cacheHasIt) {
-            {
-              _showSyncBanner('\u274c This shipment has been removed from the system.');
-              var resultEl = document.getElementById('tracking-result');
-              if (resultEl && resultEl.classList.contains('show')) {
-                resultEl.innerHTML = '<div style="text-align:center;padding:3rem;color:var(--muted-foreground)"><h3 style="font-size:1.25rem;font-weight:600;margin-bottom:.5rem">Shipment Removed</h3><p>This tracking number is no longer active. Please contact support if you need help.</p></div>';
-              }
-              return;
-            }
-          }
-          var ship = _getActiveShip();
-          if (!ship) return;
-          _showSyncBanner('\ud83d\udd04 Live update received from dispatch \u2014 refreshing...');
-          setTimeout(function() {
-            var s2 = _getActiveShip();
-            if (s2 && typeof showTrackingResult === 'function') {
-              showTrackingResult(s2);
-              // Trigger delay popup if newly delayed
-              if((s2.status||'').toLowerCase()==='delayed' && window.showDelayPopup) {
-                setTimeout(function(){ window.showDelayPopup(s2); }, 500);
-              }
-            }
-          }, 600);
-          return;
-        }
-
-        // ── CHAT UPDATE ──
+        // ── CHAT UPDATE ── (script.js handles shipment_update)
         if (data.type === 'chat_update') {
           if (window._chatConvId && window.SyncEngine) {
             var msgs = SyncEngine.getMessages(window._chatConvId);
@@ -365,18 +313,16 @@
               if (chatMsgs && endRef) {
                 var div = document.createElement('div');
                 div.className = 'msg admin';
-                var now = new Date(last.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-                div.innerHTML = '<div class="msg-bubble"><div class="msg-text">' + last.text.replace(/\n/g,'<br>') + '</div><div class="msg-time">' + now + '</div></div>';
+                var nowT = new Date(last.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+                div.innerHTML = '<div class="msg-bubble"><div class="msg-text">' + last.text.replace(/\n/g,'<br>') + '</div><div class="msg-time">' + nowT + '</div></div>';
                 chatMsgs.insertBefore(div, endRef);
                 endRef.scrollIntoView({behavior:'smooth'});
               }
             }
           }
         }
-
       });
     }
-
 
     // mergeAdminShipments is defined in script.js and runs automatically
   })();

@@ -222,12 +222,28 @@
     const mode = (shipment.shippingMethod || '').toLowerCase().includes('air') ? 'air' :
       (shipment.shippingMethod || '').toLowerCase().includes('sea') ? 'sea' : 'road';
 
-    const route = buildRoute(fromCoords, toCoords, mode, 140);
+    // Prefer SyncEngine route (validated, matches current origin/dest) over generating new one.
+    // This avoids a route mismatch where live-routes draws a different path than professional-routes.
+    let route = null;
+    if (window.SyncEngine && SyncEngine.loadRoutes) {
+      const stored = SyncEngine.loadRoutes();
+      const cached = stored && stored[shipment.id || shipment.trackingNumber];
+      if (cached && cached.length > 5) {
+        // Validate: cached route endpoints must match current coords within ~2 degrees
+        const oD = Math.hypot((cached[0][0]||0)-(fromCoords[0]||0), (cached[0][1]||0)-(fromCoords[1]||0));
+        const dD = Math.hypot((cached[cached.length-1][0]||0)-(toCoords[0]||0), (cached[cached.length-1][1]||0)-(toCoords[1]||0));
+        if(oD <= 2 && dD <= 2) route = cached;
+      }
+    }
+    // Only build a new route if SyncEngine doesn't have a valid one
+    if (!route) route = buildRoute(fromCoords, toCoords, mode, 140);
 
-    // Remove old route/marker if present
-    if (window._lrUserRouteLine) { try { leafletMap.removeLayer(window._lrUserRouteLine); } catch (e) {} }
-    if (window._lrUserMarker) { try { leafletMap.removeLayer(window._lrUserMarker); } catch (e) {} }
+    // ALWAYS remove old route/marker and animation before drawing new ones.
+    // This is the critical cleanup that prevents ghost layers on map re-init.
+    if (window._lrUserRouteLine) { try { leafletMap.removeLayer(window._lrUserRouteLine); } catch (e) {} window._lrUserRouteLine = null; }
+    if (window._lrUserMarker) { try { leafletMap.removeLayer(window._lrUserMarker); } catch (e) {} window._lrUserMarker = null; }
     clearInterval(window._lrUserAnimInterval);
+    window._lrUserAnimInterval = null;
 
     // Draw dashed full route (origin → destination)
     window._lrUserRouteLine = L.polyline(route, {
@@ -273,33 +289,44 @@
 
     // Animate along route (only for active statuses)
     if (isActive) {
+      // Capture route reference at this point in time — used throughout this closure
+      const _capturedRoute = route;
       let idx = routeIdx;
       window._lrUserAnimInterval = setInterval(function () {
+        // If the marker was removed (map re-init), stop animation
+        if (!window._lrUserMarker) { clearInterval(window._lrUserAnimInterval); return; }
+
         // Check if admin moved it
         const livePos = getLivePosition(shipment);
         if (livePos && livePos.progress !== undefined) {
-          const newIdx = Math.min(Math.floor((livePos.progress / 100) * (route.length - 1)), route.length - 1);
-          if (Math.abs(newIdx - idx) > 2) idx = newIdx; // jump if admin moved it significantly
+          const newIdx = Math.min(Math.floor((livePos.progress / 100) * (_capturedRoute.length - 1)), _capturedRoute.length - 1);
+          if (Math.abs(newIdx - idx) > 2) idx = newIdx;
         }
-        idx = Math.min(idx + 1, route.length - 1);
-        if (window._lrUserMarker) {
-          window._lrUserMarker.setLatLng(route[idx]);
-          // Update live location display
-          const lld = document.getElementById('live-location-display');
-          if (lld) {
-            // Approximate nearest named location
-            const lat = route[idx][0], lng = route[idx][1];
-            let nearest = null, minDist = Infinity;
-            for (const [name, coords] of Object.entries(WORLD_COORDS)) {
-              const d = Math.sqrt(Math.pow(coords[0] - lat, 2) + Math.pow(coords[1] - lng, 2));
-              if (d < minDist) { minDist = d; nearest = name; }
-            }
-            if (nearest && minDist < 5) {
-              lld.textContent = nearest.split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
-            }
+        idx = Math.min(idx + 1, _capturedRoute.length - 1);
+        try {
+          window._lrUserMarker.setLatLng(_capturedRoute[idx]);
+        } catch(e) {
+          clearInterval(window._lrUserAnimInterval);
+          window._lrUserAnimInterval = null;
+          return;
+        }
+        // Update live location display
+        const lld = document.getElementById('live-location-display');
+        if (lld) {
+          const lat = _capturedRoute[idx][0], lng = _capturedRoute[idx][1];
+          let nearest = null, minDist = Infinity;
+          for (const [name, coords] of Object.entries(WORLD_COORDS)) {
+            const d = Math.sqrt(Math.pow(coords[0] - lat, 2) + Math.pow(coords[1] - lng, 2));
+            if (d < minDist) { minDist = d; nearest = name; }
+          }
+          if (nearest && minDist < 5) {
+            lld.textContent = nearest.split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
           }
         }
-        if (idx >= route.length - 1) clearInterval(window._lrUserAnimInterval);
+        if (idx >= _capturedRoute.length - 1) {
+          clearInterval(window._lrUserAnimInterval);
+          window._lrUserAnimInterval = null;
+        }
       }, 2000);
     }
 
@@ -434,8 +461,23 @@
     // Wait for script.js to define initAustraliaMap, then wrap it
     const _patch = function () {
       if (typeof window.initAustraliaMap !== 'function') return;
+      if (window._lrPatched) return; // avoid double-patching
+      window._lrPatched = true;
       const orig = window.initAustraliaMap;
       window.initAustraliaMap = function (shipment) {
+        // CRITICAL: clear live-routes animation and layers BEFORE calling orig.
+        // If we don't do this, the old interval fires against a stale map reference
+        // after Leaflet destroys it, causing silent errors and ghost markers.
+        clearInterval(window._lrUserAnimInterval);
+        window._lrUserAnimInterval = null;
+        if (window._lrUserMarker) {
+          try { if (window.leafletMap) window.leafletMap.removeLayer(window._lrUserMarker); } catch(e) {}
+          window._lrUserMarker = null;
+        }
+        if (window._lrUserRouteLine) {
+          try { if (window.leafletMap) window.leafletMap.removeLayer(window._lrUserRouteLine); } catch(e) {}
+          window._lrUserRouteLine = null;
+        }
         orig.call(this, shipment);
         // Short delay to let Leaflet fully initialize
         setTimeout(function () {

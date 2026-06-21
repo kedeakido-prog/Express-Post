@@ -394,6 +394,40 @@ const AU_CITIES={
 /* Convert a raw Supabase shipment row into the display shape used by showTrackingResult() */
 function _normaliseShipment(ship) {
   if (!ship) return null;
+  // If ship is already normalised (has .trackingNumber and .origin.city set properly)
+  // do a lightweight update rather than full re-normalisation which would clobber
+  // origin/destination with flat-column reads that are undefined on normalised objects.
+  if (ship._adminManaged && ship.trackingNumber && ship.origin && ship.origin.city && ship.origin.city !== '—') {
+    // Already normalised — refresh dynamic fields only, preserve all origin/destination data
+    const _lp = window.SyncEngine ? SyncEngine.getShipmentPosition(ship.id || ship.trackingNumber) : null;
+    if (_lp && typeof _lp.progress === 'number') ship.progress = _lp.progress;
+    // Refresh status text in case status changed
+    const _sm2 = {
+      pending:{text:'Awaiting Pickup',color:'#eab308'}, picked_up:{text:'Picked Up',color:'#3b82f6'},
+      in_transit:{text:'In Transit',color:'#3b82f6'}, 'in-transit':{text:'In Transit',color:'#3b82f6'},
+      out_for_delivery:{text:'Out for Delivery',color:'#0891b2'}, delivered:{text:'Delivered',color:'#22c55e'},
+      delayed:{text:'Delayed',color:'#ef4444'}, processing:{text:'Processing',color:'#7c3aed'},
+    }[ship.status] || { text: ship.status || 'Unknown', color:'#6b7280' };
+    ship.statusText  = _sm2.text;
+    ship.statusColor = _sm2.color;
+    // Ensure shippingMethod is always set (may be missing on first normalise pass)
+    if (!ship.shippingMethod || ship.shippingMethod === 'undefined') {
+      const _mm = { road:'Road Freight', air:'Air Freight', sea:'Sea Freight' };
+      const _tm = ship.transportMode || 'road';
+      ship.shippingMethod = _mm[_tm] || 'Road Freight';
+    }
+    // Ensure dispatchDate is never 'undefined'
+    if (!ship.dispatchDate || ship.dispatchDate === 'undefined' || ship.dispatchDate === '—') {
+      const _cr = ship.createdAt || ship.created_at || '';
+      if (_cr && _cr !== 'undefined') {
+        try { ship.dispatchDate = new Date(_cr).toLocaleDateString('en-AU',{day:'2-digit',month:'short',year:'numeric'}); }
+        catch(e) { ship.dispatchDate = '—'; }
+      } else {
+        ship.dispatchDate = '—';
+      }
+    }
+    return ship;
+  }
   const statusMap = {
     pending:          { text:'Awaiting Pickup',    color:'#eab308' },
     picked_up:        { text:'Picked Up',          color:'#3b82f6' },
@@ -431,23 +465,25 @@ function _normaliseShipment(ship) {
   const sender   = _safeObj(ship.sender)   || {};
   const receiver = _safeObj(ship.receiver) || {};
 
-  // Build origin — merge JSONB + flat columns so nothing is ever undefined
+  // Build origin — flat columns (origin_city) are the authoritative source for
+  // city name because the UPDATE writes to both flat and JSONB columns.
+  // Flat columns always reflect the latest edit; JSONB may lag if only flat was written.
   const _rawOrigin = _safeObj(ship.origin) || {};
   const origin = {
-    city:   _rawOrigin.city  || ship.origin_city  || '—',
-    state:  _rawOrigin.state || ship.origin_state  || '',
+    city:   ship.origin_city  || _rawOrigin.city  || '—',
+    state:  _rawOrigin.state  || ship.origin_state || '',
     country:_rawOrigin.country || ship.sender_country || 'Australia',
-    lat:    _rawOrigin.lat   || (_rawOrigin.coordinates && _rawOrigin.coordinates[0]) || 0,
-    lng:    _rawOrigin.lng   || (_rawOrigin.coordinates && _rawOrigin.coordinates[1]) || 0,
+    lat:    _rawOrigin.lat    || (_rawOrigin.coordinates && _rawOrigin.coordinates[0]) || 0,
+    lng:    _rawOrigin.lng    || (_rawOrigin.coordinates && _rawOrigin.coordinates[1]) || 0,
     coordinates: _rawOrigin.coordinates || [_rawOrigin.lat||0, _rawOrigin.lng||0],
   };
 
-  // Build destination — same strategy
+  // Build destination — same strategy: flat column wins for city name
   const _rawDest = _safeObj(ship.destination) || {};
   const dest = {
-    city:   _rawDest.city   || ship.destination_city  || '—',
-    state:  _rawDest.state  || ship.destination_state  || '',
-    country:_rawDest.country || ship.receiver_country  || 'Australia',
+    city:   ship.destination_city || _rawDest.city  || '—',
+    state:  _rawDest.state  || ship.destination_state || '',
+    country:_rawDest.country || ship.receiver_country || 'Australia',
     lat:    _rawDest.lat    || (_rawDest.coordinates && _rawDest.coordinates[0]) || 0,
     lng:    _rawDest.lng    || (_rawDest.coordinates && _rawDest.coordinates[1]) || 0,
     coordinates: _rawDest.coordinates || [_rawDest.lat||0, _rawDest.lng||0],
@@ -468,15 +504,28 @@ function _normaliseShipment(ship) {
     lng:     livePos ? livePos.lng : (_rawCurLoc.lng || (_rawCurLoc.coordinates&&_rawCurLoc.coordinates[1]) || origin.lng || 0),
   };
 
-  // Calculate real progress from movement engine
-  // Use live progress from DB lookup if available
-  let progress = ship._liveProgress !== undefined ? ship._liveProgress
-    : (ship.status === 'delivered' ? 100 : ship.status === 'pending' ? 5 : 50);
-  if (livePos && typeof livePos.progress === 'number') progress = livePos.progress;
-  else if (window.SyncEngine && SyncEngine.loadMoveStates) {
-    const ms = SyncEngine.loadMoveStates()[ship.id || ship.trackingNumber];
-    if (ms && ms.routeIdx !== undefined && ms.totalRouteLen) {
-      progress = Math.round((ms.routeIdx / (ms.totalRouteLen - 1)) * 100);
+  // Calculate progress — strict priority order:
+  // 1. delivered → always 100
+  // 2. Live position from in-memory movement engine (admin same browser)
+  // 3. Time-corrected progress from shipment_movement DB lookup (_liveProgress)
+  // 4. progress_pct column in shipments table (written by admin on every Supabase sync)
+  // 5. In-memory move state (cross-tab via BroadcastChannel)
+  // This gives cross-device consistency: tracking page on mobile reads (4) which
+  // admin writes on every movement sync, so both always show the same number.
+  let progress = 0;
+  if (ship.status === 'delivered') {
+    progress = 100;
+  } else if (ship._liveProgress !== undefined) {
+    progress = ship._liveProgress;
+  } else if (livePos && typeof livePos.progress === 'number') {
+    progress = livePos.progress;
+  } else if (typeof ship.progress_pct === 'number' && ship.progress_pct > 0) {
+    // Authoritative DB value — same number admin wrote via _syncShipToSupabase
+    progress = ship.progress_pct;
+  } else if (window.SyncEngine && SyncEngine.loadMoveStates) {
+    const _msT = SyncEngine.loadMoveStates()[ship.id || ship.trackingNumber];
+    if (_msT && _msT.state && _msT.state !== 'idle' && _msT.routeIdx !== undefined && _msT.totalRouteLen) {
+      progress = Math.round((_msT.routeIdx / (_msT.totalRouteLen - 1)) * 100);
     }
   }
 
@@ -492,21 +541,21 @@ function _normaliseShipment(ship) {
     statusColor:      sm.color,
     senderName:       sender.name    || ship.sender_name    || '—',
     senderAddress:    [sender.address, sender.city, sender.country].filter(Boolean).join(', ') || '—',
-    senderCity:       sender.city    || origin.city || '—',
-    senderCountry:    sender.country || origin.country || 'Australia',
+    senderCity:       (function(){ const v = sender.city || origin.city; return (v && v !== 'undefined' && v !== 'null') ? v : '—'; })(),
+    senderCountry:    (function(){ const v = sender.country || origin.country; return (v && v !== 'undefined' && v !== 'null') ? v : 'Australia'; })(),
     receiverName:     receiver.name  || ship.receiver_name  || '—',
     receiverAddress:  [receiver.address, receiver.city, receiver.country].filter(Boolean).join(', ') || '—',
-    receiverCity:     receiver.city  || dest.city || '—',
-    receiverCountry:  receiver.country || dest.country || 'Australia',
+    receiverCity:     (function(){ const v = receiver.city || dest.city; return (v && v !== 'undefined' && v !== 'null') ? v : '—'; })(),
+    receiverCountry:  (function(){ const v = receiver.country || dest.country; return (v && v !== 'undefined' && v !== 'null') ? v : 'Australia'; })(),
     receiverEmail:    receiver.email || ship.receiver_email || '',
     receiverPhone:    receiver.phone || ship.receiver_phone || '',
     packageType:      ship.packageType  || ship.package_type  || 'General',
     packageName:      ship.packageName  || ship.package_name  || 'Package',
     weight:           ship.weight      || '—',
     dimensions:       ship.dimensions  || '—',
-    transportMode:    ship.transportMode || ship.transport_mode || 'road',
-    shippingMethod:   methodMap[ship.transportMode || ship.transport_mode] || 'Road Freight',
-    dispatchDate:     createdRaw ? new Date(createdRaw).toLocaleDateString('en-AU',{day:'2-digit',month:'short',year:'numeric'}) : '—',
+    transportMode:    (function(){ const m = ship.transportMode || ship.transport_mode; return (m && m !== 'undefined' && m !== 'null') ? m : 'road'; })(),
+    shippingMethod:   (function(){ const m = ship.transportMode || ship.transport_mode; const mm = (m && m !== 'undefined' && m !== 'null') ? m : 'road'; return methodMap[mm] || 'Road Freight'; })(),
+    dispatchDate:     (createdRaw && createdRaw !== 'undefined' && createdRaw !== 'null') ? (function(){ try{ return new Date(createdRaw).toLocaleDateString('en-AU',{day:'2-digit',month:'short',year:'numeric'}); } catch(e){ return '—'; } })() : '—',
     estimatedDelivery:estDelRaw  ? new Date(estDelRaw).toLocaleDateString('en-AU',{day:'2-digit',month:'short',year:'numeric'}) : '—',
     currentLocation:  curLocMerged,
     origin,
@@ -551,9 +600,24 @@ async function lookupShipment(trackingNumber) {
 
       if (mv && mv.route_idx !== undefined) {
         // Inject live position into ship object
-        const route = mv.route_geometry
-          ? (typeof mv.route_geometry === 'string' ? JSON.parse(mv.route_geometry) : mv.route_geometry)
+        // Use 'let' not 'const' so we can discard a stale route below
+        let route = mv.route_geometry
+          ? (typeof mv.route_geometry === 'string'
+              ? (function(){ try{ return JSON.parse(mv.route_geometry); } catch(e){ return null; } })()
+              : mv.route_geometry)
           : null;
+
+        // Validate the stored route still matches the shipment's current
+        // origin/destination — reject it if it was left over from a previous edit
+        if (route && route.length > 1 && rawShip.origin && rawShip.destination) {
+          const _oC = (rawShip.origin && rawShip.origin.coordinates) || [0,0];
+          const _dC = (rawShip.destination && rawShip.destination.coordinates) || [0,0];
+          const _od = Math.hypot((route[0][0]||0)-(_oC[0]||0), (route[0][1]||0)-(_oC[1]||0));
+          const _dd = Math.hypot((route[route.length-1][0]||0)-(_dC[0]||0), (route[route.length-1][1]||0)-(_dC[1]||0));
+          if (_od > 2 || _dd > 2) route = null; // discard stale route
+        } else if (route && route.length <= 1) {
+          route = null;
+        }
 
         if (route && route.length > 1) {
           // Time-correct the position
@@ -619,8 +683,21 @@ async function lookupShipment(trackingNumber) {
 /* Sync listener — refresh displayed shipment when admin updates it */
 (function() {
   if (!window.SyncEngine) return;
+  // Debounce timer — prevents rapid broadcasts from triggering multiple updates
+  var _trackingUpdateTimer = null;
+  // Track the last status+delay state so map only reinits on genuine changes
+  var _lastTrackingStatus = null;
+  var _lastTrackingDelay  = null;
+
   SyncEngine.onUpdate(function(data) {
-    // Handle deletion — hide result if deleted shipment is currently shown
+    // Helper: show the sync banner (also exposed in tracking.html)
+    function _banner(msg) {
+      if (typeof window._showSyncBanner === 'function') {
+        window._showSyncBanner(msg);
+      }
+    }
+
+    // Handle deletion immediately — no debounce needed
     if (data.type === 'shipment_deleted') {
       const resultSec = document.getElementById('tracking-result');
       const inp = document.getElementById('tracking-number-input');
@@ -635,38 +712,86 @@ async function lookupShipment(trackingNumber) {
       }
       return;
     }
-    if (data.type !== 'shipment_update' && data.type !== 'move_update') return;
+    // move_update fast path is handled by tracking.html inline script — skip full re-render
+    if (data.type === 'move_update') return;
+    if (data.type !== 'shipment_update') return;
     const resultSec = document.getElementById('tracking-result');
     if (!resultSec || !resultSec.classList.contains('show')) return;
-    const inp = document.getElementById('tracking-number-input');
-    const tn = inp ? inp.value.trim().toUpperCase() : null;
-    if (!tn) return;
-    lookupShipment(tn).then(function(updShip) {
-      if (!updShip) {
-        resultSec.classList.remove('show');
-        return;
+
+    // Debounce: collapse rapid-fire broadcasts into a single update
+    // Position ticks fire every 1.5s — we only need to react once per 5s
+    if (_trackingUpdateTimer) return; // already queued
+    _trackingUpdateTimer = setTimeout(function() {
+      _trackingUpdateTimer = null;
+
+      const inp = document.getElementById('tracking-number-input');
+      const tn = inp ? inp.value.trim().toUpperCase() : null;
+      if (!tn) return;
+
+      // Use cached shipment data if available — avoids a DB round-trip on every tick.
+      // Only fall back to lookupShipment for genuine data changes (status / delay).
+      const cachedShip = window._currentDisplayedShipment;
+      if (cachedShip) {
+        // Update progress from live movement state — no DB needed
+        const lp = window.SyncEngine && SyncEngine.getShipmentPosition
+          ? SyncEngine.getShipmentPosition(cachedShip.id || cachedShip.trackingNumber)
+          : null;
+        if (lp && typeof lp.progress === 'number') {
+          cachedShip.progress = lp.progress;
+          // Update progress bar without re-rendering entire result
+          const progBar = document.getElementById('progress-fill');
+          const progPct = document.getElementById('live-progress-pct');
+          if (progBar) progBar.style.width = lp.progress + '%';
+          if (progPct) progPct.textContent = lp.progress;
+        }
+
+        // Check if status or delay changed — only then do a full re-fetch and re-render
+        const ms = window.SyncEngine && SyncEngine.loadMoveStates
+          ? SyncEngine.loadMoveStates()[cachedShip.id || cachedShip.trackingNumber]
+          : null;
+        const currentStatus = (ms && ms.state) || cachedShip.status || '';
+        const currentDelay  = cachedShip.delayReason || '';
+        if (currentStatus === _lastTrackingStatus && currentDelay === _lastTrackingDelay) {
+          return; // No meaningful change — skip full re-render
+        }
+        _lastTrackingStatus = currentStatus;
+        _lastTrackingDelay  = currentDelay;
       }
-      var key = (updShip.status||'') + (updShip.progress||0) + (updShip.delayReason||'');
-      var existingBanner = document.getElementById('delay-notification-banner');
-      var isNowDelayed = (updShip.status||'').toLowerCase().replace(/_/g,'-') === 'delayed';
-      if (isNowDelayed && !existingBanner) {
-        var banner = document.createElement('div');
-        banner.id = 'delay-notification-banner';
-        banner.style.cssText = 'background:linear-gradient(135deg,#fffbeb,#fef3c7);border:2px solid #fde68a;border-radius:.875rem;padding:1rem 1.25rem;margin-bottom:1.25rem;display:flex;align-items:flex-start;gap:.875rem;box-shadow:0 4px 16px rgba(245,158,11,.15)';
-        banner.innerHTML = '<div style="flex:1"><div style="font-weight:800;color:#92400e;font-size:.9375rem;margin-bottom:.25rem">⚠ Shipment Delayed</div>'
-          + '<div style="color:#78350f;font-size:.8125rem;line-height:1.5">' + (updShip.delayReason || 'Your shipment is currently delayed.') + '</div>'
-          + (updShip.estimatedDelivery ? '<div style="margin-top:.375rem;font-size:.75rem;color:#b45309;font-weight:600">Updated ETA: ' + updShip.estimatedDelivery + '</div>' : '')
-          + '</div>';
-        resultSec.insertBefore(banner, resultSec.firstChild);
-        if (window.showDelayPopup) setTimeout(function() { window.showDelayPopup(updShip); }, 300);
-      } else if (!isNowDelayed && existingBanner) {
-        existingBanner.remove();
-      }
-      if (window._lastMapKey !== key) {
-        window._lastMapKey = key;
-        if (window.initAustraliaMap && window.leafletMap) window.initAustraliaMap(updShip);
-      }
-    });
+
+      // Genuine status/delay change — do full lookup and re-render
+      _banner('\ud83d\udd04 Live update received from dispatch \u2014 refreshing...');
+      lookupShipment(tn).then(function(updShip) {
+        if (!updShip) { resultSec.classList.remove('show'); return; }
+
+        // Safe merge — never let a fresh DB fetch destroy live position data
+        // that tickMovement set in _currentDisplayedShipment
+        const safeUpdate = (window.SyncEngine && window.SyncEngine.safeMergeShipment)
+          ? window.SyncEngine.safeMergeShipment(window._currentDisplayedShipment || updShip, updShip)
+          : updShip;
+
+        window._currentDisplayedShipment = safeUpdate;
+        _lastTrackingStatus = safeUpdate.status || '';
+        _lastTrackingDelay  = safeUpdate.delayReason || '';
+
+        var existingBanner = document.getElementById('delay-notification-banner');
+        var isNowDelayed = (safeUpdate.status||'').toLowerCase().replace(/_/g,'-') === 'delayed';
+        if (isNowDelayed && !existingBanner) {
+          var banner = document.createElement('div');
+          banner.id = 'delay-notification-banner';
+          banner.style.cssText = 'background:linear-gradient(135deg,#fffbeb,#fef3c7);border:2px solid #fde68a;border-radius:.875rem;padding:1rem 1.25rem;margin-bottom:1.25rem;display:flex;align-items:flex-start;gap:.875rem;box-shadow:0 4px 16px rgba(245,158,11,.15)';
+          banner.innerHTML = '<div style="flex:1"><div style="font-weight:800;color:#92400e;font-size:.9375rem;margin-bottom:.25rem">Shipment Delayed</div>'
+            + '<div style="color:#78350f;font-size:.8125rem;line-height:1.5">' + (safeUpdate.delayReason || 'Your shipment is currently delayed.') + '</div>'
+            + (safeUpdate.estimatedDelivery ? '<div style="margin-top:.375rem;font-size:.75rem;color:#b45309;font-weight:600">Updated ETA: ' + safeUpdate.estimatedDelivery + '</div>' : '')
+            + '</div>';
+          resultSec.insertBefore(banner, resultSec.firstChild);
+          if (window.showDelayPopup) setTimeout(function() { window.showDelayPopup(safeUpdate); }, 300);
+        } else if (!isNowDelayed && existingBanner) {
+          existingBanner.remove();
+        }
+        // Only reinit map on genuine status change, not on every position tick
+        if (window.initAustraliaMap && window.leafletMap) window.initAustraliaMap(safeUpdate);
+      });
+    }, 5000); // 5s debounce — position ticks are visual-only, handled by animInterval
   });
 })();
 
@@ -788,7 +913,21 @@ function showDelayPopup(shipment) {
    PDF GENERATION
    ════════════════════════════════════════ */
 function generateShipmentPDF(shipment){
-  const timelineRows=shipment.timeline.map(ev=>`
+  // Always use the freshest available data — live position may have updated since card rendered
+  const s = window._currentDisplayedShipment || shipment;
+  if (!s || !s.trackingNumber) {
+    alert('Unable to generate PDF — shipment data not available. Please try again.');
+    return;
+  }
+  // Merge live progress into PDF snapshot
+  const livePos = window.SyncEngine && SyncEngine.getShipmentPosition
+    ? SyncEngine.getShipmentPosition(s.id || s.trackingNumber) : null;
+  const pct = livePos && typeof livePos.progress === 'number' ? livePos.progress
+    : (typeof s.progress === 'number' ? s.progress : 0);
+  const curCity = (livePos && livePos.city) ? livePos.city
+    : ((s.currentLocation && s.currentLocation.city) ? s.currentLocation.city : (s.origin && s.origin.city) || '—');
+
+  const timelineRows=s.timeline.map(ev=>`
     <tr style="border-bottom:1px solid #e5e7eb;">
       <td style="padding:7px 10px;font-size:11px;color:${ev.completed?'#111':'#9ca3af'}">${ev.date}</td>
       <td style="padding:7px 10px;font-size:11px;font-weight:${ev.completed?'600':'400'};color:${ev.completed?'#111':'#9ca3af'}">${ev.status}</td>
@@ -796,7 +935,7 @@ function generateShipmentPDF(shipment){
       <td style="padding:7px 10px;text-align:center"><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;background:${ev.completed?'#111':'#f3f4f6'};color:${ev.completed?'#fff':'#9ca3af'}">${ev.completed?'DONE':'PENDING'}</span></td>
     </tr>`).join('');
 
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shipment – ${shipment.trackingNumber}</title>
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shipment – ${s.trackingNumber}</title>
   <style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:Arial,sans-serif;background:#fff;color:#111;font-size:12px;line-height:1.5;}
   .page{width:210mm;min-height:297mm;margin:0 auto;padding:14mm 16mm;background:#fff;}
   .hdr{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:14px;border-bottom:3px solid #111;margin-bottom:18px;}
@@ -835,19 +974,19 @@ function generateShipmentPDF(shipment){
   </style></head><body><div class="page">
   <div class="hdr">
     <div><div class="co">EXPRESS POST<span> AUSTRALIA</span></div><div class="co-sub">Australia's Premier Courier &amp; Freight Solutions</div><div class="co-contact">ABN: 28 864 970 579 &nbsp;|&nbsp; +61 493 148 492 &nbsp;|&nbsp; info@expresspostaustralia.com &nbsp;|&nbsp; expresspostaustralia.com</div></div>
-    <div class="dtitle"><h2>Shipment Receipt</h2><div class="tnum">${shipment.trackingNumber}</div><div class="ddate">Issued: ${new Date().toLocaleDateString('en-AU',{day:'2-digit',month:'long',year:'numeric'})}</div></div>
+    <div class="dtitle"><h2>Shipment Receipt</h2><div class="tnum">${s.trackingNumber}</div><div class="ddate">Issued: ${new Date().toLocaleDateString('en-AU',{day:'2-digit',month:'long',year:'numeric'})}</div></div>
   </div>
-  <div class="sbar" style="${(shipment.status||'').toLowerCase()==='delayed'?'background:linear-gradient(135deg,#d97706,#b45309)':''}">
-    <div><div class="sbar-lbl">Current Status</div><div class="sbar-val">${shipment.statusText.toUpperCase()} — ${shipment.currentLocation.city||'—'}, ${shipment.currentLocation.state||''}</div></div>
-    <div><div class="sbar-lbl" style="text-align:right">Progress</div><div class="sbar-val">${typeof shipment.progress==='number'?shipment.progress:0}% Complete</div></div>
-    <div><span class="sbadge" style="${(shipment.status||'').toLowerCase()==='delayed'?'background:#fff;color:#b45309;border:2px solid #fde68a':''}">${shipment.statusText}</span></div>
+  <div class="sbar" style="${(s.status||'').toLowerCase()==='delayed'?'background:linear-gradient(135deg,#d97706,#b45309)':''}">
+    <div><div class="sbar-lbl">Current Status</div><div class="sbar-val">${s.statusText.toUpperCase()} — ${curCity}, ${(s.currentLocation&&s.currentLocation.state)||''}</div></div>
+    <div><div class="sbar-lbl" style="text-align:right">Progress</div><div class="sbar-val">${pct}% Complete</div></div>
+    <div><span class="sbadge" style="${(s.status||'').toLowerCase()==='delayed'?'background:#fff;color:#b45309;border:2px solid #fde68a':''}">${s.statusText}</span></div>
   </div>
   ${(()=>{
-    if((shipment.status||'').toLowerCase()!=='delayed') return '';
-    const dr = shipment.delayReason||'Logistics Issues';
+    if((s.status||'').toLowerCase()!=='delayed') return '';
+    const dr = s.delayReason||'Logistics Issues';
     let dtStr = '';
-    if(shipment.delayTimestamp){try{dtStr='<div style="font-size:10px;color:#b45309;margin-bottom:3px"><strong>Delay Recorded:</strong> '+new Date(shipment.delayTimestamp).toLocaleString('en-AU',{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'})+'</div>';}catch(e){dtStr='';}}
-    const etaStr = shipment.estimatedDelivery ? '<div style="font-size:10px;color:#92400e;font-weight:700;margin-top:4px">Updated ETA: '+shipment.estimatedDelivery+'</div>' : '';
+    if(s.delayTimestamp){try{dtStr='<div style="font-size:10px;color:#b45309;margin-bottom:3px"><strong>Delay Recorded:</strong> '+new Date(s.delayTimestamp).toLocaleString('en-AU',{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'})+'</div>';}catch(e){dtStr='';}}
+    const etaStr = s.estimatedDelivery ? '<div style="font-size:10px;color:#92400e;font-weight:700;margin-top:4px">Updated ETA: '+s.estimatedDelivery+'</div>' : '';
     return '<div style="background:linear-gradient(135deg,#fffbeb,#fef3c7);border:2.5px solid #f59e0b;border-radius:8px;padding:14px 18px;margin-bottom:16px;display:flex;gap:14px;align-items:flex-start;">'
       +'<div style="width:38px;height:38px;border-radius:8px;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
       +'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
@@ -859,36 +998,36 @@ function generateShipmentPDF(shipment){
       +'<div style="font-size:10px;color:#b45309;margin-top:5px;font-style:italic">This shipment is temporarily on hold. Movement paused until delay is resolved.</div>'
       +'</div></div>';
   })()}
-  <div class="prog-row"><span>${shipment.origin.city}, ${shipment.origin.state||''}</span><span>Delivery Progress: ${typeof shipment.progress==='number'?shipment.progress:0}%</span><span>${shipment.destination.city}, ${shipment.destination.state||''}</span></div>
-  <div class="prog-bg"><div class="prog-fill" style="width:${typeof shipment.progress==='number'?shipment.progress:0}%"></div></div>
+  <div class="prog-row"><span>${s.origin.city}, ${s.origin.state||''}</span><span>Delivery Progress: ${pct}%</span><span>${s.destination.city}, ${s.destination.state||''}</span></div>
+  <div class="prog-bg"><div class="prog-fill" style="width:${pct}%"></div></div>
   <div class="grid2">
     <div class="card"><div class="card-title">▲ Sender (Origin)</div>
-      <div class="row"><div class="key">Company / Name</div><div class="val">${shipment.senderName}</div></div>
-      <div class="row"><div class="key">Address</div><div class="val">${shipment.senderAddress}</div></div>
-      <div class="row"><div class="key">Origin City</div><div class="val">${shipment.origin.city}, ${shipment.origin.state||''}</div></div>
+      <div class="row"><div class="key">Company / Name</div><div class="val">${s.senderName}</div></div>
+      <div class="row"><div class="key">Address</div><div class="val">${s.senderAddress}</div></div>
+      <div class="row"><div class="key">Origin City</div><div class="val">${s.origin.city}, ${s.origin.state||''}</div></div>
     </div>
     <div class="card"><div class="card-title">▼ Recipient (Destination)</div>
-      <div class="row"><div class="key">Company / Name</div><div class="val">${shipment.receiverName}</div></div>
-      <div class="row"><div class="key">Address</div><div class="val">${shipment.receiverAddress}</div></div>
-      <div class="row"><div class="key">Destination City</div><div class="val">${shipment.destination.city}, ${shipment.destination.state||''}</div></div>
-      ${shipment.receiverEmail?`<div class="row"><div class="key">Email</div><div class="val">${shipment.receiverEmail}</div></div>`:''}
-      ${shipment.receiverPhone?`<div class="row"><div class="key">Phone</div><div class="val">${shipment.receiverPhone}</div></div>`:''}
+      <div class="row"><div class="key">Company / Name</div><div class="val">${s.receiverName}</div></div>
+      <div class="row"><div class="key">Address</div><div class="val">${s.receiverAddress}</div></div>
+      <div class="row"><div class="key">Destination City</div><div class="val">${s.destination.city}, ${s.destination.state||''}</div></div>
+      ${s.receiverEmail?`<div class="row"><div class="key">Email</div><div class="val">${s.receiverEmail}</div></div>`:''}
+      ${s.receiverPhone?`<div class="row"><div class="key">Phone</div><div class="val">${s.receiverPhone}</div></div>`:''}
     </div>
   </div>
   <div class="grid2">
     <div class="card"><div class="card-title">📦 Package Details</div>
-      <div class="row"><div class="key">Package Type</div><div class="val">${shipment.packageType}</div></div>
-      <div class="row"><div class="key">Weight</div><div class="val">${shipment.weight}</div></div>
-      <div class="row"><div class="key">Dimensions</div><div class="val">${shipment.dimensions}</div></div>
-      <div class="row"><div class="key">Shipping Method</div><div class="val">${shipment.shippingMethod}</div></div>
-      ${shipment.notes?`<div class="row"><div class="key">Special Instructions</div><div class="val">${shipment.notes}</div></div>`:''}
+      <div class="row"><div class="key">Package Type</div><div class="val">${s.packageType}</div></div>
+      <div class="row"><div class="key">Weight</div><div class="val">${s.weight}</div></div>
+      <div class="row"><div class="key">Dimensions</div><div class="val">${s.dimensions}</div></div>
+      <div class="row"><div class="key">Shipping Method</div><div class="val">${s.shippingMethod}</div></div>
+      ${s.notes?`<div class="row"><div class="key">Special Instructions</div><div class="val">${s.notes}</div></div>`:''}
     </div>
     <div class="card"><div class="card-title">🚚 Courier Details</div>
-      <div class="row"><div class="key">Courier Service</div><div class="val">${shipment.courier?.name||'Express Post Australia'}</div></div>
-      <div class="row"><div class="key">Vehicle / Asset</div><div class="val">${shipment.courier?.vehicle||'–'}</div></div>
-      <div class="row"><div class="key">Driver / Handler</div><div class="val">${shipment.courier?.driver||'–'}</div></div>
-      <div class="row"><div class="key">Dispatch Date</div><div class="val">${shipment.dispatchDate}</div></div>
-      <div class="row"><div class="key">Est. Delivery Date</div><div class="val">${shipment.estimatedDelivery}</div></div>
+      <div class="row"><div class="key">Courier Service</div><div class="val">${s.courier?.name||'Express Post Australia'}</div></div>
+      <div class="row"><div class="key">Vehicle / Asset</div><div class="val">${s.courier?.vehicle||'–'}</div></div>
+      <div class="row"><div class="key">Driver / Handler</div><div class="val">${s.courier?.driver||'–'}</div></div>
+      <div class="row"><div class="key">Dispatch Date</div><div class="val">${s.dispatchDate}</div></div>
+      <div class="row"><div class="key">Est. Delivery Date</div><div class="val">${s.estimatedDelivery}</div></div>
     </div>
   </div>
   <div class="sec-title">Shipment Timeline &amp; History</div>
@@ -900,13 +1039,31 @@ function generateShipmentPDF(shipment){
   </div>
   <div class="footer">
     <div class="footer-l"><strong>EXPRESS POST AUSTRALIA PTY LTD</strong><br>Level 12, 1 Bligh Street, Sydney NSW 2000 | ABN: 28 864 970 579<br>This document is computer-generated and valid without a handwritten signature unless otherwise stated.</div>
-    <div class="footer-r"><strong>${shipment.trackingNumber}</strong><br>Generated: ${new Date().toLocaleString('en-AU')}<br>© ${new Date().getFullYear()} Express Post Australia Pty Ltd</div>
+    <div class="footer-r"><strong>${s.trackingNumber}</strong><br>Generated: ${new Date().toLocaleString('en-AU')}<br>© ${new Date().getFullYear()} Express Post Australia Pty Ltd</div>
   </div>
   </div></body></html>`;
 
-  const win=window.open('','_blank','width=900,height=750');
-  win.document.write(html);win.document.close();win.focus();
-  setTimeout(()=>win.print(),700);
+  try {
+    const win = window.open('','_blank','width=900,height=750');
+    if (!win) {
+      // Popup blocked — fallback: blob download
+      const blob = new Blob([html], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'Shipment_' + s.trackingNumber + '.html';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      return;
+    }
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => { try { win.print(); } catch(e) {} }, 700);
+  } catch(e) {
+    console.error('[PDF] Failed to open print window:', e);
+    alert('Could not open print window. Please allow pop-ups for this site and try again.');
+  }
 }
 
 /* ════════════════════════════════════════
@@ -996,8 +1153,24 @@ function getNearestCity(lat, lng) {
 // ─ OSRM Route Cache
 const _osmRouteCache = {};
 
+// Expose bust function so admin can clear OSRM cache when origin/destination changes
+window._clearOSRMRouteCache = function(fromCoords, toCoords) {
+  if (!fromCoords || !toCoords) {
+    // Clear entire cache
+    Object.keys(_osmRouteCache).forEach(k => delete _osmRouteCache[k]);
+    return;
+  }
+  // Clear specific entry (try both 3dp and 4dp keys for safety)
+  [3, 4].forEach(dp => {
+    const key = fromCoords[0].toFixed(dp)+','+fromCoords[1].toFixed(dp)+':'+toCoords[0].toFixed(dp)+','+toCoords[1].toFixed(dp);
+    delete _osmRouteCache[key];
+  });
+};
+
 async function _fetchOSRMRoute(from, to){
-  const key = from[0].toFixed(3)+','+from[1].toFixed(3)+':'+to[0].toFixed(3)+','+to[1].toFixed(3);
+  // 4 decimal places ≈ 11m precision — enough to differentiate suburb-level changes
+  // while still caching identical routes efficiently
+  const key = from[0].toFixed(4)+','+from[1].toFixed(4)+':'+to[0].toFixed(4)+','+to[1].toFixed(4);
   if(_osmRouteCache[key]) return _osmRouteCache[key];
   try{
     const url = `https://router.project-osrm.org/route/v1/driving/${from[1]},${from[0]};${to[1]},${to[0]}?overview=full&geometries=geojson`;
@@ -1241,11 +1414,24 @@ async function initAustraliaMap(shipment){
   let route = null;
   const routeTransportMode = shipment.transportMode || 'road';
 
-  // 1. Check shared SyncEngine route cache (admin + user share same geometry)
+  // 1. Check shared SyncEngine route cache — validate against current coordinates
+  //    to avoid drawing a stale route left over from before an origin/destination edit
   if(window.SyncEngine && SyncEngine.loadRoutes){
     const stored = SyncEngine.loadRoutes();
     const id = shipment.id || shipment.trackingNumber;
-    if(stored && stored[id] && stored[id].length > 10) route = stored[id];
+    const cached = stored && stored[id];
+    if(cached && cached.length > 10){
+      const originDrift = Math.hypot((cached[0][0]||0)-(from[0]||0), (cached[0][1]||0)-(from[1]||0));
+      const destDrift   = Math.hypot((cached[cached.length-1][0]||0)-(to[0]||0), (cached[cached.length-1][1]||0)-(to[1]||0));
+      // Accept cached route only when both endpoints match current coords within ~0.5°
+      // (55km). This catches suburb-level origin/dest changes that the 2° check missed.
+      if(originDrift <= 0.5 && destDrift <= 0.5) route = cached;
+      else {
+        // Stale — evict so it is regenerated from the new cities
+        delete stored[id];
+        if(window._routeCache) delete window._routeCache[id];
+      }
+    }
   }
 
   // 2. Generate route based on transport mode
@@ -1454,18 +1640,28 @@ async function initAustraliaMap(shipment){
       if(truckMarker){
         truckMarker.setLatLng(route[routeIdx]);
 
-        // Update completed route line
-        if(doneLine){ try{map.removeLayer(doneLine);}catch(e){} }
-        doneLine = L.polyline(route.slice(0, routeIdx+1), {
-          color: trackColor, weight: 6, opacity: 0.95, lineJoin:'round', lineCap:'round',
-        }).addTo(map);
-
-        // Update remaining route line
-        if(remainLine){ try{map.removeLayer(remainLine);}catch(e){} }
-        if(routeIdx < route.length-1){
-          remainLine = L.polyline(route.slice(routeIdx), {
-            color: '#93c5fd', weight: 3.5, opacity: 0.6, dashArray:'11 8', lineJoin:'round',
+        // Update completed route line in-place — setLatLngs() avoids
+        // destroying and recreating the layer which caused marker flickering
+        if(doneLine){
+          doneLine.setLatLngs(route.slice(0, routeIdx+1));
+        } else {
+          doneLine = L.polyline(route.slice(0, routeIdx+1), {
+            color: trackColor, weight: 6, opacity: 0.95, lineJoin:'round', lineCap:'round',
           }).addTo(map);
+        }
+
+        // Update remaining route line in-place
+        if(routeIdx < route.length-1){
+          if(remainLine){
+            remainLine.setLatLngs(route.slice(routeIdx));
+          } else {
+            remainLine = L.polyline(route.slice(routeIdx), {
+              color: '#93c5fd', weight: 3.5, opacity: 0.6, dashArray:'11 8', lineJoin:'round',
+            }).addTo(map);
+          }
+        } else if(remainLine){
+          try{ map.removeLayer(remainLine); }catch(e){}
+          remainLine = null;
         }
 
         // Update live location display
@@ -1483,6 +1679,21 @@ async function initAustraliaMap(shipment){
               const displayCity = nearest.replace(/\b\w/g,w=>w.toUpperCase());
               if(displayCity && displayCity.trim()) lld.textContent = displayCity;
             }
+          }
+        }
+
+        // Live-patch progress bar and percentage displays without re-rendering
+        if(route.length > 1){
+          const liveProgress = Math.round((routeIdx / (route.length - 1)) * 100);
+          const _pb  = document.getElementById('progress-fill');   // main progress bar
+          const _pp  = document.getElementById('live-progress-pct'); // "X% · N/M checkpoints"
+          const _pm  = document.getElementById('live-progress-map'); // right-column %
+          if(_pb)  _pb.style.width = liveProgress + '%';
+          if(_pp)  _pp.textContent = liveProgress;
+          if(_pm)  _pm.textContent = liveProgress + '%';
+          // Also update cached shipment progress so onUpdate handler has fresh value
+          if(window._currentDisplayedShipment){
+            window._currentDisplayedShipment.progress = liveProgress;
           }
         }
       }
@@ -1510,6 +1721,8 @@ async function initAustraliaMap(shipment){
    TRACKING RESULT RENDER
    ════════════════════════════════════════ */
 function showTrackingResult(shipment){
+  // Store reference for the onUpdate handler to use without a DB fetch
+  window._currentDisplayedShipment = shipment;
   const resultSection=document.getElementById('tracking-result');
   const errorMsg=document.getElementById('tracking-error');
   if(errorMsg)errorMsg.classList.remove('show');
@@ -1564,9 +1777,9 @@ function showTrackingResult(shipment){
     <!-- Progress -->
     <div>
       <div style="display:flex;justify-content:space-between;margin-bottom:.5rem;font-size:.8rem;font-weight:500">
-        <span style="color:var(--muted-foreground)">${shipment.origin.city}, ${shipment.origin.state||''}</span>
-        <span style="color:var(--foreground)">${typeof shipment.progress==='number'?shipment.progress:0}% &nbsp;·&nbsp; ${completedCount}/${shipment.timeline.length} checkpoints done</span>
-        <span style="color:var(--muted-foreground)">${shipment.destination.city}, ${shipment.destination.state||''}</span>
+        <span style="color:var(--muted-foreground)">${shipment.origin.city||'—'}${shipment.origin.state ? ', '+shipment.origin.state : ''}</span>
+        <span style="color:var(--foreground)"><span id="live-progress-pct">${typeof shipment.progress==='number'?shipment.progress:0}</span>% &nbsp;·&nbsp; ${completedCount}/${shipment.timeline.length} checkpoints done</span>
+        <span style="color:var(--muted-foreground)">${shipment.destination.city||'—'}${shipment.destination.state ? ', '+shipment.destination.state : ''}</span>
       </div>
       <div style="height:.625rem;background:var(--muted);border-radius:9999px;overflow:hidden">
         <div id="progress-fill" style="height:100%;width:0%;background:linear-gradient(90deg,var(--primary),#60a5fa);border-radius:9999px;transition:width .9s ease"></div>
@@ -1633,7 +1846,7 @@ function showTrackingResult(shipment){
         </div>
         <div style="text-align:right;flex-shrink:0">
           <div style="font-size:.6875rem;color:var(--muted-foreground);margin-bottom:.125rem">Progress</div>
-          <div style="font-size:.875rem;font-weight:700;color:var(--primary)">${typeof shipment.progress==='number'?shipment.progress:0}%</div>
+          <div style="font-size:.875rem;font-weight:700;color:var(--primary)" id="live-progress-map">${typeof shipment.progress==='number'?shipment.progress:0}%</div>
         </div>
       </div>
       <!-- Map -->
